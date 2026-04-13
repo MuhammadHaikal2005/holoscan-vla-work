@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+*.csv
+*.log
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
