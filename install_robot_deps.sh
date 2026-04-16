@@ -18,7 +18,9 @@ echo "=== Installing robot control dependencies ==="
 # deepdiff        — required by lerobot.motors internals
 # tqdm            — progress bars used in lerobot calibration
 # feetech-servo-sdk — provides the scservo_sdk driver
-pip3 install --quiet pyzmq msgpack pyserial deepdiff tqdm feetech-servo-sdk
+pip3 install --quiet pyzmq msgpack pyserial deepdiff tqdm feetech-servo-sdk opencv-python-headless pyfakewebcam
+# Note: opencv-python-headless is used (no GUI). RGB frames are streamed via
+# named pipe (--rgb-pipe) and viewed with ffplay on the host.
 echo "[OK] pip packages installed"
 
 # ---------- lerobot (editable, no-deps) ----------

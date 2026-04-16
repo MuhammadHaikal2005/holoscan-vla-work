@@ -103,6 +103,72 @@ def _connect_and_configure_bus(bus):
 
 
 # ---------------------------------------------------------------------------
+# sRGB conversion helpers
+# ---------------------------------------------------------------------------
+
+def _linear_to_srgb_gpu(linear: "cp.ndarray") -> "cp.ndarray":
+    """Apply the sRGB piecewise transfer function to a CuPy float32 array in [0, 1].
+
+    Mirrors the hardware sRGB conversion that HolovizOp applies during scanout,
+    giving the model input that matches what is displayed on screen.
+    IMX274 is a 12-bit sensor; callers should normalize with / 4095.0 before calling.
+    """
+    linear = cp.clip(linear, 0.0, 1.0)
+    return cp.where(
+        linear <= 0.0031308,
+        linear * 12.92,
+        1.055 * cp.power(cp.maximum(linear, 0.0031308), 1.0 / 2.4) - 0.055,
+    )
+
+
+# ---------------------------------------------------------------------------
+# SrgbConvertOp — RGBA uint16 → RGB uint8 on GPU, shared by policy + preview
+# ---------------------------------------------------------------------------
+
+class SrgbConvertOp(holoscan.core.Operator):
+    """Converts the raw RGBA uint16 demosaic tensor to RGB uint8 entirely on GPU.
+
+    Applies the sRGB piecewise transfer function (same curve that HolovizOp
+    applies in hardware) with a configurable linear exposure multiplier.
+    The output stays on GPU as a CuPy array — no CPU round-trip.
+
+    Downstream consumers:
+    - PolicyClientOp: receives RGB uint8 and skips its own conversion block.
+    - Preview HolovizOp: displays exactly what the model receives.
+    """
+
+    def __init__(self, fragment, name, exposure=1.0):
+        super().__init__(fragment, name)
+        self._exposure = cp.float32(exposure)
+
+    def setup(self, spec):
+        spec.input("image")
+        spec.output("converted")
+
+    def compute(self, op_input, op_output, context):
+        message = op_input.receive("image")
+        if isinstance(message, dict):
+            image_tensor = message.get("") or list(message.values())[0]
+        else:
+            image_tensor = message
+
+        frame = cp.asarray(image_tensor)
+
+        if frame.ndim == 3 and frame.shape[-1] == 4:
+            frame = frame[:, :, :3]
+
+        if frame.dtype == cp.uint16:
+            linear = (frame.astype(cp.float32) / 4095.0) * self._exposure
+            frame = (_linear_to_srgb_gpu(linear) * 255.0).clip(0, 255).astype(cp.uint8)
+        elif cp.issubdtype(frame.dtype, cp.floating):
+            frame = (_linear_to_srgb_gpu(frame * self._exposure) * 255.0).clip(0, 255).astype(cp.uint8)
+
+        frame = cp.ascontiguousarray(frame)
+        # Emit as dict so both PolicyClientOp and HolovizOp receivers handle it
+        op_output.emit({"": frame}, "converted")
+
+
+# ---------------------------------------------------------------------------
 # PolicyClientOp — reads state, converts frame, queries policy server
 # ---------------------------------------------------------------------------
 
@@ -114,18 +180,15 @@ class PolicyClientOp(holoscan.core.Operator):
     16-step action chunk.  On each tick it emits the next action step as a
     Python dict for RobotActionOp to execute."""
 
-    DEFAULT_GAIN = 0.7
-
     def __init__(self, fragment, name, bus, policy_host, policy_port,
-                 action_horizon, lang_instruction, gain=None):
+                 action_horizon, lang_instruction, exposure=1.0):
         super().__init__(fragment, name)
         self._bus = bus
         self._policy_host = policy_host
         self._policy_port = policy_port
         self._action_horizon = action_horizon
         self._lang = lang_instruction
-        gain = gain if gain is not None else self.DEFAULT_GAIN
-        self._scale = cp.float32(255.0 / 4095.0 * gain)
+        self._exposure = cp.float32(exposure)
         self._client = None
         self._action_chunk = None
         self._step = 0
@@ -164,10 +227,14 @@ class PolicyClientOp(holoscan.core.Operator):
             frame = cp.asarray(image_tensor)
             if frame.ndim == 3 and frame.shape[-1] == 4:
                 frame = frame[:, :, :3]
-            if frame.dtype == cp.uint16:
-                frame = (frame * self._scale).clip(0, 255).astype(cp.uint8)
+            if frame.dtype == cp.uint8:
+                # Already converted by SrgbConvertOp upstream — use as-is
+                pass
+            elif frame.dtype == cp.uint16:
+                linear = (frame.astype(cp.float32) / 4095.0) * self._exposure
+                frame = (_linear_to_srgb_gpu(linear) * 255.0).clip(0, 255).astype(cp.uint8)
             elif cp.issubdtype(frame.dtype, cp.floating):
-                frame = (cp.clip(frame, 0.0, 1.0) * 255).astype(cp.uint8)
+                frame = (_linear_to_srgb_gpu(frame * self._exposure) * 255.0).clip(0, 255).astype(cp.uint8)
             frame = cp.ascontiguousarray(frame)
             rgb = cp.asnumpy(frame)
 
@@ -336,6 +403,8 @@ class HoloscanApplication(holoscan.core.Application):
         lang_instruction="Move the blue dice",
         action_log=None,
         sent_log=None,
+        exposure=1.0,
+        show_preview=False,
     ):
         logging.info("__init__")
         super().__init__()
@@ -354,6 +423,8 @@ class HoloscanApplication(holoscan.core.Application):
         self._lang_instruction = lang_instruction
         self._action_log = action_log
         self._sent_log = sent_log
+        self._exposure = exposure
+        self._show_preview = show_preview
 
     def compose(self):
         logging.info("compose")
@@ -442,13 +513,33 @@ class HoloscanApplication(holoscan.core.Application):
             framebuffer_srgb=True,
         )
 
-        # Camera pipeline: receiver → csi_to_bayer → image_processor → demosaic
+        # Camera pipeline: receiver → csi_to_bayer → image_processor → demosaic → holoviz
         self.add_flow(receiver_operator, csi_to_bayer_operator, {("output", "input")})
         self.add_flow(
             csi_to_bayer_operator, image_processor_operator, {("output", "input")}
         )
         self.add_flow(image_processor_operator, demosaic, {("output", "receiver")})
         self.add_flow(demosaic, visualizer, {("transmitter", "receivers")})
+
+        # Optional preview: SrgbConvertOp tapped from demosaic, shown in a
+        # second HolovizOp with framebuffer_srgb=False (tensor is already sRGB).
+        srgb_convert_op = None
+        if self._show_preview:
+            srgb_convert_op = SrgbConvertOp(
+                self,
+                name="srgb_convert",
+                exposure=self._exposure,
+            )
+            preview_viz = holoscan.operators.HolovizOp(
+                self,
+                name="preview",
+                fullscreen=False,
+                headless=self._headless,
+                framebuffer_srgb=False,
+                tensors=[{"name": "", "type": "color", "opacity": 1.0}],
+            )
+            self.add_flow(demosaic, srgb_convert_op, {("transmitter", "image")})
+            self.add_flow(srgb_convert_op, preview_viz, {("converted", "receivers")})
 
         # Robot control branch (only when a motor bus is provided)
         if self._motor_bus is not None:
@@ -460,6 +551,7 @@ class HoloscanApplication(holoscan.core.Application):
                 policy_port=self._policy_port,
                 action_horizon=self._action_horizon,
                 lang_instruction=self._lang_instruction,
+                exposure=self._exposure,
             )
             robot_action_op = RobotActionOp(
                 self,
@@ -468,7 +560,12 @@ class HoloscanApplication(holoscan.core.Application):
                 log_path=self._action_log,
                 sent_log_path=self._sent_log,
             )
-            self.add_flow(demosaic, policy_client_op, {("transmitter", "image")})
+            if srgb_convert_op is not None:
+                # SrgbConvertOp already converted the frame — PolicyClientOp
+                # will detect uint8 input and skip its own conversion block.
+                self.add_flow(srgb_convert_op, policy_client_op, {("converted", "image")})
+            else:
+                self.add_flow(demosaic, policy_client_op, {("transmitter", "image")})
             self.add_flow(policy_client_op, robot_action_op, {("action", "action")})
 
 
@@ -577,6 +674,20 @@ def main():
         metavar="PATH",
         help="Write actually-sent motor commands + present positions to a CSV file",
     )
+    parser.add_argument(
+        "--exposure",
+        type=float,
+        default=0.3,
+        help="Linear exposure multiplier applied before sRGB curve (default 0.3)",
+    )
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help=(
+            "Open a second HolovizOp window showing exactly what GR00T receives "
+            "(RGB uint8, already sRGB). Uses SrgbConvertOp on GPU; no extra CPU copy."
+        ),
+    )
 
     args = parser.parse_args()
     hololink_module.logging_level(args.log_level)
@@ -627,6 +738,8 @@ def main():
         lang_instruction=args.lang_instruction,
         action_log=args.action_log,
         sent_log=args.sent_log,
+        exposure=args.exposure,
+        show_preview=args.preview,
     )
     application.config(args.configuration)
 

@@ -57,17 +57,39 @@ def _v4l2_missing_help(device: str) -> str:
     )
 
 
-class V4L2SinkOp(holoscan.core.Operator):
-    """Streams demosaic output to a v4l2loopback device as YUYV."""
+_LINEAR_GAIN = np.float32(255.0 / 4095.0 * 0.7)  # original linear scale
 
-    # Brightness gain applied on top of the 12-bit -> 8-bit linear map.
-    DEFAULT_GAIN = 0.7
+
+def _linear_to_srgb_gpu(linear: "cp.ndarray") -> "cp.ndarray":
+    """Apply the sRGB piecewise transfer function to a CuPy float32 array in [0, 1].
+
+    Mirrors the hardware sRGB conversion that HolovizOp applies during scanout.
+    IMX274 is a 12-bit sensor; callers should normalize with / 4095.0 before calling.
+    """
+    linear = cp.clip(linear, 0.0, 1.0)
+    return cp.where(
+        linear <= 0.0031308,
+        linear * 12.92,
+        1.055 * cp.power(cp.maximum(linear, 0.0031308), 1.0 / 2.4) - 0.055,
+    )
+
+
+class V4L2SinkOp(holoscan.core.Operator):
+    """Streams demosaic output to a v4l2loopback device as YUYV.
+
+    Pass ``use_linear=True`` to use the old linear+gain conversion so you can
+    compare it against the sRGB output side-by-side.
+    """
 
     def __init__(self, fragment, name, device="/dev/video10",
-                 width=1920, height=1080, gain=None):
+                 width=1920, height=1080, use_linear=False, exposure=1.0,
+                 rgb_pipe=None):
         super().__init__(fragment, name)
         self.width = width
         self.height = height
+        self._use_linear = use_linear
+        self._exposure = cp.float32(exposure)
+        self._rgb_pipe = None
         # pyfakewebcam handles V4L2 device setup (ioctl VIDIOC_S_FMT);
         # we bypass its schedule_frame which uses the removed ndarray.tostring().
         if not os.path.exists(device):
@@ -78,9 +100,22 @@ class V4L2SinkOp(holoscan.core.Operator):
             raise FileNotFoundError(_v4l2_missing_help(device)) from e
         self._fd = self._cam._video_device
         self._expected_bytes = width * height * 2  # YUYV = 2 bytes/pixel
-        gain = gain if gain is not None else self.DEFAULT_GAIN
-        self._scale = cp.float32(255.0 / 4095.0 * gain)
         self._yuyv_buf = np.empty((height, width * 2), dtype=np.uint8)
+        if rgb_pipe:
+            if not os.path.exists(rgb_pipe):
+                os.mkfifo(rgb_pipe)
+            # Open non-blocking so we don't hang if ffplay isn't connected yet
+            pipe_fd = os.open(rgb_pipe, os.O_WRONLY | os.O_NONBLOCK)
+            self._rgb_pipe = pipe_fd
+            logging.info("V4L2SinkOp: streaming RGB to pipe %s", rgb_pipe)
+            logging.info(
+                "  On host run: ffplay -f rawvideo -pixel_format rgb24 "
+                "-video_size %dx%d %s", width, height, rgb_pipe,
+            )
+        logging.info(
+            "V4L2SinkOp: using %s conversion",
+            "LINEAR (old)" if use_linear else "sRGB (new)",
+        )
 
     def setup(self, spec):
         spec.input("input")
@@ -99,12 +134,25 @@ class V4L2SinkOp(holoscan.core.Operator):
             frame = frame[:, :, :3]
 
         if frame.dtype == cp.uint16:
-            frame = (frame * self._scale).clip(0, 255).astype(cp.uint8)
+            if self._use_linear:
+                frame = (frame * cp.float32(_LINEAR_GAIN)).clip(0, 255).astype(cp.uint8)
+            else:
+                linear = (frame.astype(cp.float32) / 4095.0) * self._exposure
+                frame = (_linear_to_srgb_gpu(linear) * 255.0).clip(0, 255).astype(cp.uint8)
         elif cp.issubdtype(frame.dtype, cp.floating):
-            frame = (cp.clip(frame, 0.0, 1.0) * 255).astype(cp.uint8)
+            if self._use_linear:
+                frame = (cp.clip(frame, 0.0, 1.0) * 255).astype(cp.uint8)
+            else:
+                frame = (_linear_to_srgb_gpu(frame * self._exposure) * 255.0).clip(0, 255).astype(cp.uint8)
 
         frame = cp.ascontiguousarray(frame)
         rgb = cp.asnumpy(frame)
+
+        if self._rgb_pipe is not None:
+            try:
+                os.write(self._rgb_pipe, rgb.tobytes())
+            except BlockingIOError:
+                pass  # ffplay not yet connected or too slow — drop the frame
 
         yuv = cv2.cvtColor(rgb, cv2.COLOR_RGB2YUV)
         y = yuv[:, :, 0]
@@ -134,8 +182,10 @@ class HoloscanApplication(holoscan.core.Application):
         camera_mode,
         frame_limit,
         v4l2_device,
-        v4l2_gain,
         use_v4l2_sink,
+        use_linear=False,
+        exposure=1.0,
+        rgb_pipe=None,
     ):
         logging.info("__init__")
         super().__init__()
@@ -148,8 +198,10 @@ class HoloscanApplication(holoscan.core.Application):
         self._camera_mode = camera_mode
         self._frame_limit = frame_limit
         self._v4l2_device = v4l2_device
-        self._v4l2_gain = v4l2_gain
         self._use_v4l2_sink = use_v4l2_sink
+        self._use_linear = use_linear
+        self._exposure = exposure
+        self._rgb_pipe = rgb_pipe
 
     def compose(self):
         logging.info("compose")
@@ -248,7 +300,9 @@ class HoloscanApplication(holoscan.core.Application):
                 device=self._v4l2_device,
                 width=self._camera._width,
                 height=self._camera._height,
-                gain=self._v4l2_gain,
+                use_linear=self._use_linear,
+                exposure=self._exposure,
+                rgb_pipe=self._rgb_pipe,
             )
             self.add_flow(demosaic, v4l2_sink, {("transmitter", "input")})
 
@@ -315,15 +369,31 @@ def main():
         help="v4l2loopback device path for fake webcam output",
     )
     parser.add_argument(
-        "--v4l2-gain",
-        type=float,
-        default=None,
-        help="12-bit->8-bit brightness gain (default: V4L2SinkOp.DEFAULT_GAIN)",
-    )
-    parser.add_argument(
         "--no-v4l2-sink",
         action="store_true",
         help="Holoviz only; skip v4l2loopback (use when /dev/videoN is not set up)",
+    )
+    parser.add_argument(
+        "--linear",
+        action="store_true",
+        help="Use old linear+gain conversion instead of sRGB (for before/after comparison)",
+    )
+    parser.add_argument(
+        "--exposure",
+        type=float,
+        default=0.3,
+        help="Linear exposure multiplier applied before sRGB curve (default 0.3)",
+    )
+    parser.add_argument(
+        "--rgb-pipe",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write raw RGB24 frames to this named pipe for viewing with ffplay. "
+            "The pipe is created automatically if it does not exist. "
+            "Then on the host run: ffplay -f rawvideo -pixel_format rgb24 "
+            "-video_size WxH PATH"
+        ),
     )
     args = parser.parse_args()
     hololink_module.logging_level(args.log_level)
@@ -362,8 +432,10 @@ def main():
         camera_mode,
         args.frame_limit,
         v4l2_device=args.v4l2_device,
-        v4l2_gain=args.v4l2_gain,
         use_v4l2_sink=use_v4l2,
+        use_linear=args.linear,
+        exposure=args.exposure,
+        rgb_pipe=args.rgb_pipe,
     )
     application.config(args.configuration)
 
