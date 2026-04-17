@@ -60,12 +60,17 @@ JOINT_NAMES = [
     "gripper",
 ]
 
-DEFAULT_CALIBRATION_DIR = (
-    "/home/latticeapp/.cache/huggingface/lerobot/calibration/robots/so_follower"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+DEFAULT_FOLLOWER_CALIBRATION_DIR = str(
+    _REPO_ROOT / "calibration" / "robots" / "so_follower"
+)
+DEFAULT_LEADER_CALIBRATION_DIR = str(
+    _REPO_ROOT / "calibration" / "teleoperators" / "so_leader"
 )
 
 # Root directory for local dataset storage (relative to repo root)
-DATASETS_ROOT = Path(__file__).resolve().parent.parent / "datasets"
+DATASETS_ROOT = _REPO_ROOT / "datasets"
 
 # ---------------------------------------------------------------------------
 # Experiment dataset definitions
@@ -443,8 +448,10 @@ def main():
                         help="Serial port for the SO-101 follower arm")
     parser.add_argument("--follower-id", default="my_follower",
                         help="Robot ID used to locate the calibration JSON")
-    parser.add_argument("--calibration-dir", default=DEFAULT_CALIBRATION_DIR,
-                        help="Directory containing <id>.json calibration files")
+    parser.add_argument("--calibration-dir", default=DEFAULT_FOLLOWER_CALIBRATION_DIR,
+                        help="Directory containing follower <id>.json calibration files")
+    parser.add_argument("--leader-calibration-dir", default=DEFAULT_LEADER_CALIBRATION_DIR,
+                        help="Directory containing leader <id>.json calibration files")
 
     # Leader arm (teleop) — optional
     parser.add_argument("--leader-port", default=None,
@@ -498,8 +505,7 @@ def main():
 
     leader_bus = None
     if args.leader_port:
-        leader_dir = os.path.join(args.calibration_dir, "..", "so_leader")
-        leader_cal = os.path.join(leader_dir, f"{args.leader_id}.json")
+        leader_cal = os.path.join(args.leader_calibration_dir, f"{args.leader_id}.json")
         leader_bus = _create_and_connect_bus(args.leader_port, leader_cal, "leader")
 
     # ------------------------------------------------------------------ Dataset
