@@ -1,29 +1,68 @@
 # HSB + GR00T Robot Control
 
 Runs the NVIDIA Holoscan Sensor Bridge (HSB) IMX274 camera through a GPU
-pipeline and feeds frames to a GR00T N1.6 policy server to control an SO-101
-robot arm.
+pipeline, feeds frames to a GR00T N1.6 policy server to control an SO-101
+robot arm, and records LeRobot-compatible datasets for training.
 
 ---
 
-## How it works
+## Repository layout
+
+```
+hsb-groot-robot/
+├── run.sh                     Docker launcher (mounts, env vars, PYTHONPATH)
+├── install_robot_deps.sh      One-time pip install inside the container
+├── README.md
+│
+├── pipeline/                  Holoscan camera pipeline scripts (run inside Docker)
+│   ├── linux_imx274_player.py       Main inference + teleop pipeline
+│   ├── imx274_zmq_server.py         ZMQ camera publisher (for dataset recording)
+│   ├── linux_imx274_player_v4l2_sink.py  Legacy v4l2 bridge (reference only)
+│   └── example_configuration.yaml  Holoscan YAML config
+│
+├── recording/                 Dataset recording scripts (run on host)
+│   └── imx274_lerobot_record.py     LeRobot dataset recorder (ZMQ camera input)
+│
+├── payload/                   HSB payload transmission experiments
+│   ├── thor_send_payload.py
+│   ├── thor_send_payload_with_ecb.py
+│   └── test_udp_listener.py
+│
+├── payload_generator_op/      Custom C++ Holoscan operator (GPU tensor emitter)
+│   ├── CMakeLists.txt
+│   ├── build.sh
+│   ├── payload_generator_op.{hpp,cpp}
+│   └── payload_generator_op_pybind.cpp
+│
+├── references/                Upstream reference scripts
+│   └── lerobot_record.py
+│
+├── notes/                     Debugging documentation
+│   └── thor_send_payload_debugging.md
+│
+└── logs/                      Runtime log output (gitignored)
+```
+
+---
+
+## How the inference pipeline works
 
 ```
 IMX274 camera (ethernet, 192.168.0.2)
-  └─ LinuxReceiverOp       reassembles UDP packets into one raw frame
-      └─ CsiToBayerOp      raw CSI  →  Bayer uint16  (GPU)
-          └─ ImageProcessorOp  optical black subtraction, white balance
-              └─ BayerDemosaicOp  Bayer  →  RGBA uint16  (GPU)
+  └─ LinuxReceiverOp        reassembles UDP packets into one raw frame
+      └─ CsiToBayerOp       raw CSI  →  Bayer uint16  (GPU)
+          └─ ImageProcessorOp   optical black subtraction, white balance
+              └─ BayerDemosaicOp    Bayer  →  RGBA uint16  (GPU)
                   ├─ HolovizOp "holoviz"
                   │       hardware sRGB curve at scanout  →  display window
                   │       (always on)
                   │
                   ├─ SrgbConvertOp          [only with --preview]
                   │       drops alpha, applies sRGB in CuPy, emits RGB uint8
-                  │       stays 100% on GPU — no CPU copy here
+                  │       stays 100% on GPU — no CPU copy
                   │   ├─ HolovizOp "preview"
                   │   │       shows exactly what GR00T receives
-                  │   └─ PolicyClientOp     [only with robot mode]
+                  │   └─ PolicyClientOp     [robot mode + --preview]
                   │           skips its own conversion (uint8 detected)
                   │
                   └─ PolicyClientOp         [robot mode, no --preview]
@@ -37,9 +76,31 @@ IMX274 camera (ethernet, 192.168.0.2)
 
 ---
 
+## How the dataset recording pipeline works
+
+```
+Docker container                         Host
+────────────────                         ────
+imx274_zmq_server.py                     imx274_lerobot_record.py
+  LinuxReceiverOp                          ZMQCamera
+    CsiToBayerOp                             ↑ JPEG over ZMQ (port 5556)
+      ImageProcessorOp             FeetechMotorsBus (follower, USB)
+        BayerDemosaicOp            FeetechMotorsBus (leader,   USB) ← optional
+          SrgbConvertOp                LeRobotDataset.add_frame()
+            ZmqPublisherOp ──────→       └─ Parquet + video (LeRobot v2)
+```
+
+No v4l2loopback, no YUYV422 conversion, no lag — the RGB uint8 CuPy
+tensor from `SrgbConvertOp` is JPEG-encoded on the GPU and sent directly
+over ZMQ to the recording script on the host.
+
+---
+
 ## Setup (one-time)
 
 ### 1 — Start the GR00T policy server (host, outside Docker)
+
+> Only needed for inference (`linux_imx274_player.py`), not for recording.
 
 ```bash
 cd ~/Isaac-GR00T
@@ -71,22 +132,24 @@ bash install_robot_deps.sh
 ```
 
 Installs `pyzmq`, `msgpack`, `pyserial`, `feetech-servo-sdk`, `lerobot`
-(editable), `opencv-python-headless`, and `pyfakewebcam`.
+(editable), and `opencv-python-headless`.
 
 ---
 
-## Running linux_imx274_player.py
+## Inference — linux_imx274_player.py
+
+> Run inside Docker via `./run.sh python pipeline/linux_imx274_player.py ...`
 
 ### Camera only — no robot
 
 ```bash
-python3 linux_imx274_player.py --camera-mode 1 --no-robot
+python pipeline/linux_imx274_player.py --camera-mode 1 --no-robot
 ```
 
 ### Camera + preview window (see exactly what GR00T receives)
 
 ```bash
-python3 linux_imx274_player.py --camera-mode 1 --no-robot --preview --exposure 0.3
+python pipeline/linux_imx274_player.py --camera-mode 1 --no-robot --preview --exposure 0.3
 ```
 
 Opens two windows: the raw demosaiced feed and the sRGB uint8 frame the model sees.
@@ -94,7 +157,7 @@ Opens two windows: the raw demosaiced feed and the sRGB uint8 frame the model se
 ### Full pipeline — camera + GR00T + robot arm
 
 ```bash
-python3 linux_imx274_player.py \
+python pipeline/linux_imx274_player.py \
     --camera-mode 1 \
     --policy-host localhost \
     --policy-port 5555 \
@@ -105,7 +168,7 @@ python3 linux_imx274_player.py \
 ### Full pipeline with preview + CSV logging
 
 ```bash
-python3 linux_imx274_player.py \
+python pipeline/linux_imx274_player.py \
     --camera-mode 1 \
     --lang-instruction "Move the blue dice" \
     --exposure 0.3 \
@@ -116,29 +179,27 @@ python3 linux_imx274_player.py \
 
 CSV files land in `$HOME` which is bind-mounted, so they persist after the container exits.
 
----
+### Arguments — linux_imx274_player.py
 
-## Arguments — linux_imx274_player.py
-
-### Camera
+#### Camera
 
 | Argument | Default | Description |
 |---|---|---|
-| `--camera-mode` | `0` | Camera resolution mode. `0` = 4K, `1` = 1080p, `2` = 4K alt. |
+| `--camera-mode` | `0` | Resolution mode. `0` = 4K, `1` = 1080p, `2` = 4K alt. |
 | `--hololink` | `192.168.0.2` | IP address of the HSB board. |
 | `--expander-configuration` | `0` | I2C expander config (`0` or `1`). |
 | `--pattern` | off | Display a built-in test pattern (0–11) instead of live camera. |
 
-### Display
+#### Display
 
 | Argument | Default | Description |
 |---|---|---|
 | `--headless` | off | Run without any display window. |
 | `--fullscreen` | off | Open the Holoviz window in fullscreen. |
 | `--preview` | off | Open a second window showing the exact RGB uint8 frame sent to GR00T. Runs `SrgbConvertOp` on GPU — no extra CPU copy. |
-| `--exposure` | `0.3` | Linear brightness multiplier applied before the sRGB curve. Raise to brighten, lower to darken. Applied in linear light space so the sRGB tone curve stays correct. |
+| `--exposure` | `0.3` | Linear brightness multiplier applied before the sRGB curve. |
 
-### Robot control
+#### Robot control
 
 | Argument | Default | Description |
 |---|---|---|
@@ -147,78 +208,96 @@ CSV files land in `$HOME` which is bind-mounted, so they persist after the conta
 | `--robot-id` | `my_awesome_follower_arm` | Calibration ID — must match the filename in `~/.cache/huggingface/lerobot/calibration/robots/so_follower/`. |
 | `--policy-host` | `localhost` | Hostname where the GR00T policy server is running. |
 | `--policy-port` | `5555` | ZMQ port of the GR00T policy server. |
-| `--action-horizon` | `8` | Steps to execute from each inference chunk before requesting a new one. Lower = more responsive, higher = smoother. |
-| `--lang-instruction` | `"Move the blue dice"` | Natural language task description sent to the model each inference call. |
+| `--action-horizon` | `8` | Steps to execute from each inference chunk before requesting a new one. |
+| `--lang-instruction` | `"Move the blue dice"` | Natural language task description sent to the model. |
 
-### Logging
-
-| Argument | Default | Description |
-|---|---|---|
-| `--action-log` | off | CSV file path. Logs predicted joint goal positions before each `sync_write`. |
-| `--sent-log` | off | CSV file path. Logs sent commands plus present positions read back after each `sync_write` — lets you compare commanded vs actual. |
-
-### Other
+#### Logging
 
 | Argument | Default | Description |
 |---|---|---|
+| `--action-log` | off | CSV path. Logs predicted joint goal positions before each `sync_write`. |
+| `--sent-log` | off | CSV path. Logs sent commands + present positions read back after each `sync_write`. |
 | `--frame-limit` | off | Exit after N frames. Useful for quick tests. |
-| `--configuration` | `example_configuration.yaml` | Path to the Holoscan YAML config. |
-| `--log-level` | `20` (INFO) | Python logging level. `10` = DEBUG, `20` = INFO, `30` = WARNING. |
+| `--log-level` | `20` | Python logging level. `10` = DEBUG, `20` = INFO, `30` = WARNING. |
 
 ---
 
-## Running linux_imx274_player_v4l2_sink.py
+## Dataset recording
 
-This script is a **comparison tool**. It runs the same camera pipeline but
-writes frames to a v4l2loopback device and/or a named pipe so you can visually
-compare the sRGB and old linear conversions. There is no robot control here.
+Recording uses two separate processes — one inside Docker (camera), one on the host (dataset writer).
 
-### Setup (host, before running)
+### Step 1 — Start the ZMQ camera server (inside Docker)
 
 ```bash
-sudo modprobe v4l2loopback devices=1 video_nr=10 card_label=HolovizBridge
+./run.sh python pipeline/imx274_zmq_server.py --camera-mode 1 --headless
 ```
 
-### Typical usage
+This runs the full IMX274 → `SrgbConvertOp` pipeline and publishes every
+RGB uint8 frame as a JPEG over ZMQ on port 5556. No robot arm is needed here.
+
+### Step 2 — Start the recorder (host, new terminal)
 
 ```bash
-# sRGB output (default) → /dev/video10
-python3 linux_imx274_player_v4l2_sink.py --camera-mode 1 --v4l2-device /dev/video10
-
-# Old linear output — for before/after comparison
-python3 linux_imx274_player_v4l2_sink.py --camera-mode 1 --v4l2-device /dev/video10 --linear
-
-# View the loopback feed on the host
-ffplay -f v4l2 -input_format yuyv422 -video_size 1920x1080 /dev/video10
+python recording/imx274_lerobot_record.py \
+    --repo-id my_user/my_dataset \
+    --task "Pick the red cube" \
+    --follower-port /dev/ttyACM0 \
+    --follower-id my_follower \
+    --leader-port /dev/ttyACM1 \
+    --leader-id my_leader \
+    --num-episodes 20 \
+    --episode-time 30 \
+    --no-push
 ```
 
-### View raw RGB uint8 via named pipe (no v4l2loopback needed)
+Omit `--leader-port` to record without teleoperation (follower holds position, action = state).
 
-```bash
-# Inside container:
-python3 linux_imx274_player_v4l2_sink.py \
-    --camera-mode 1 --no-v4l2-sink \
-    --rgb-pipe /home/latticeapp/rgb_feed
+### Keyboard controls during recording
 
-# Host (separate terminal):
-ffplay -f rawvideo -pixel_format rgb24 -video_size 1920x1080 /home/latticeapp/rgb_feed
-```
+| Key | Action |
+|---|---|
+| Right arrow `→` | End current phase early and move on |
+| Left arrow `←` | Discard current episode and re-record it |
+| Escape | Save current episode and stop recording |
 
-### Arguments — linux_imx274_player_v4l2_sink.py
+### Arguments — imx274_zmq_server.py
 
 | Argument | Default | Description |
 |---|---|---|
 | `--camera-mode` | `0` | Same as main player. |
-| `--v4l2-device` | `/dev/video10` | Path to the v4l2loopback device. |
-| `--no-v4l2-sink` | off | Skip the v4l2 sink. Use with `--rgb-pipe` or to run Holoviz only. |
-| `--linear` | off | Use the old `255/4095 * 0.7` linear scale instead of sRGB. |
-| `--exposure` | `0.3` | Same as main player. |
-| `--rgb-pipe` | off | Path to a named pipe. Writes raw RGB24 frames so `ffplay` can display them on the host without v4l2loopback. |
-| `--headless` | off | No display window. |
-| `--fullscreen` | off | Fullscreen Holoviz window. |
-| `--frame-limit` | off | Exit after N frames. |
 | `--hololink` | `192.168.0.2` | HSB board IP. |
-| `--log-level` | `20` | Logging level. |
+| `--headless` | on | Run without display (default for server mode). |
+| `--no-headless` | — | Show a preview window while streaming. |
+| `--preview` | off | Open sRGB preview window (requires `--no-headless`). |
+| `--zmq-port` | `5556` | ZMQ PUB port. Must match `--zmq-port` in the recorder. |
+| `--camera-name` | `front` | Camera key in the ZMQ message. |
+| `--jpeg-quality` | `90` | JPEG quality for ZMQ stream (1–100). |
+| `--exposure` | `0.3` | Same as main player. |
+| `--frame-limit` | off | Exit after N frames. |
+
+### Arguments — imx274_lerobot_record.py
+
+| Argument | Default | Description |
+|---|---|---|
+| `--repo-id` | required | Dataset repo ID, e.g. `my_user/my_dataset`. |
+| `--task` | required | Single-sentence task description. |
+| `--root` | HF_LEROBOT_HOME | Local directory to write the dataset. |
+| `--num-episodes` | `10` | Total episodes to record. |
+| `--fps` | `30` | Target recording frame rate. |
+| `--episode-time` | `30` | Seconds of data per episode. |
+| `--reset-time` | `10` | Seconds to reset the scene between episodes. |
+| `--vcodec` | `h264_nvenc` | Video codec. `h264_nvenc` uses Jetson hardware encoder. |
+| `--zmq-host` | `localhost` | Host running `imx274_zmq_server.py`. |
+| `--zmq-port` | `5556` | ZMQ port (must match server). |
+| `--camera-name` | `front` | Camera name in the ZMQ stream. |
+| `--follower-port` | `/dev/ttyACM0` | Serial port for SO-101 follower arm. |
+| `--follower-id` | `my_follower` | Follower calibration ID. |
+| `--calibration-dir` | `~/.cache/huggingface/lerobot/calibration/robots/so_follower` | Directory with `<id>.json` calibration files. |
+| `--leader-port` | off | Serial port for SO-101 leader arm (teleop). Omit to disable. |
+| `--leader-id` | `my_leader` | Leader calibration ID. |
+| `--no-push` | off | Skip pushing the finished dataset to Hugging Face Hub. |
+| `--private` | off | Make the Hub repository private. |
+| `--resume` | off | Resume recording into an existing dataset. |
 
 ---
 
@@ -227,20 +306,8 @@ ffplay -f rawvideo -pixel_format rgb24 -video_size 1920x1080 /home/latticeapp/rg
 | `--camera-mode` | Resolution | Notes |
 |---|---|---|
 | `0` | 3840×2160 (4K) | Default |
-| `1` | 1920×1080 (1080p) | Recommended for robot control |
+| `1` | 1920×1080 (1080p) | Recommended for robot control and recording |
 | `2` | 3840×2160 (4K alt) | |
-
----
-
-## Files
-
-| File | Purpose |
-|---|---|
-| `linux_imx274_player.py` | Main app — camera + optional sRGB preview + GR00T + robot arm |
-| `linux_imx274_player_v4l2_sink.py` | Comparison tool — sRGB vs linear, named pipe RGB viewer |
-| `example_configuration.yaml` | Holoscan YAML config used by both scripts |
-| `run.sh` | Docker launcher — mounts, PYTHONPATH, env vars |
-| `install_robot_deps.sh` | One-time pip install of robot deps inside the container |
 
 ---
 
@@ -249,26 +316,31 @@ ffplay -f rawvideo -pixel_format rgb24 -video_size 1920x1080 /home/latticeapp/rg
 **`ModuleNotFoundError: No module named 'holoscan'`**
 Exit the container and re-run `./run.sh`. The script sets `PYTHONPATH` automatically.
 
-**`ModuleNotFoundError: No module named 'lerobot'` / `'cv2'` / `'pyfakewebcam'`**
+**`ModuleNotFoundError: No module named 'lerobot'` / `'cv2'`**
 Run `bash install_robot_deps.sh` inside the container.
 
 **`ModuleNotFoundError: No module named 'gr00t'`**
 `run.sh` adds `~/Isaac-GR00T` to `PYTHONPATH`. Verify that directory exists on the host.
 
-**`ERROR: v4l2loopback device not found: /dev/video10`**
-Create the device on the **host** first:
-`sudo modprobe v4l2loopback devices=1 video_nr=10 card_label=HolovizBridge`
+**ZMQ camera timeout / no frames received**
+Ensure `imx274_zmq_server.py` is running inside Docker before starting the recorder.
+Check that port 5556 is not blocked. Try `--zmq-host <jetson-ip>` if running the
+recorder on a different machine.
 
 **`Failed to initialize glfw` / X11 errors**
 Run `xhost +` on the host before launching the container.
 
 **`FeetechMotorsBus: Missing motor IDs`**
 Check the arm is powered on, USB cable connected, and the port is correct (`ls /dev/ttyACM*`).
-If permission denied: `chmod 666 /dev/ttyACM0` inside the container.
+If permission denied: `chmod 666 /dev/ttyACM0`.
 
 **`ImportError: libcudss.so.0`** (policy server)
-Use the full `LD_LIBRARY_PATH` prefix shown in Setup step 1. Do not use conda envs.
+Use the full `LD_LIBRARY_PATH` prefix shown in the setup section. Do not use conda envs.
 
 **Image too bright or too dark**
 Adjust `--exposure`. Default is `0.3`. The value multiplies the linear sensor
 data before the sRGB curve, so colour relationships stay correct.
+
+**`ERROR: v4l2loopback device not found`** (legacy v4l2 script only)
+Create the device on the host first:
+`sudo modprobe v4l2loopback devices=1 video_nr=10 card_label=HolovizBridge`

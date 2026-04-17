@@ -6,6 +6,15 @@ dist/
 build/
 *.csv
 *.log
+logs/
+# Dataset files (large binary data — store separately or on HF Hub)
+datasets/**/*.parquet
+datasets/**/*.mp4
+datasets/**/*.jpg
+datasets/**/*.png
+datasets/**/data/
+datasets/**/videos/
+datasets/**/meta/
 .vscode/
 .idea/
 *.swp
