@@ -128,11 +128,21 @@ cd ~/hsb-groot-robot
 ### 3 — Install robot dependencies (inside container, first run only)
 
 ```bash
-bash install_robot_deps.sh
+./run.sh bash install_robot_deps.sh
 ```
 
 Installs `pyzmq`, `msgpack`, `pyserial`, `feetech-servo-sdk`, `lerobot`
 (editable), and `opencv-python-headless`.
+
+Packages are written to `~/.docker-packages` — a folder on the **host**
+that is bind-mounted into every container. This means the install survives
+container restarts; you only need to run this once (or when you want to
+update a package). `run.sh` adds `~/.docker-packages` to `PYTHONPATH`
+automatically.
+
+> **Note:** pip will print dependency-conflict warnings about `gr00t`
+> (torch, transformers, etc. not installed in the container). These are
+> harmless — `gr00t` is used on the host, not inside Docker.
 
 ---
 
@@ -238,19 +248,55 @@ RGB uint8 frame as a JPEG over ZMQ on port 5556. No robot arm is needed here.
 ### Step 2 — Start the recorder (host, new terminal)
 
 ```bash
+conda activate lerobot2
 python recording/imx274_lerobot_record.py \
-    --repo-id my_user/my_dataset \
-    --task "Pick the red cube" \
     --follower-port /dev/ttyACM0 \
-    --follower-id my_follower \
+    --follower-id my_awesome_follower_arm \
     --leader-port /dev/ttyACM1 \
     --leader-id my_leader \
-    --num-episodes 20 \
-    --episode-time 30 \
     --no-push
 ```
 
-Omit `--leader-port` to record without teleoperation (follower holds position, action = state).
+The script opens an **interactive menu** to select which experiment dataset
+to record into. Dataset names, repo IDs, scene setup instructions, and
+episode targets are all pre-configured in the script.
+
+Omit `--leader-port` to record without teleoperation (follower holds its
+position, action = state).
+
+#### Arm torque modes
+
+| Arm | Torque | Why |
+|---|---|---|
+| **Leader** (teleop) | OFF — compliant | You move it freely with your hand |
+| **Follower** | ON — position hold | Tracks the leader; holds position at rest |
+
+The follower reads its current position before enabling torque so it does not
+jump when recording starts.
+
+#### Starting fresh vs. resuming
+
+Delete the dataset folder to start a completely new recording session:
+
+```bash
+rm -rf datasets/control_blue_only   # or experiment_mixed_8020
+```
+
+To continue adding episodes to an existing dataset (e.g. after stopping
+mid-way through 100 episodes):
+
+```bash
+python recording/imx274_lerobot_record.py \
+    --follower-port /dev/ttyACM0 \
+    --follower-id my_awesome_follower_arm \
+    --leader-port /dev/ttyACM1 \
+    --leader-id my_leader \
+    --no-push \
+    --resume
+```
+
+If the dataset folder already contains data and `--resume` is not passed,
+the script will print an error and exit rather than overwriting.
 
 ### Keyboard controls during recording
 
@@ -316,16 +362,39 @@ Omit `--leader-port` to record without teleoperation (follower holds position, a
 **`ModuleNotFoundError: No module named 'holoscan'`**
 Exit the container and re-run `./run.sh`. The script sets `PYTHONPATH` automatically.
 
-**`ModuleNotFoundError: No module named 'lerobot'` / `'cv2'`**
-Run `bash install_robot_deps.sh` inside the container.
+**`ModuleNotFoundError: No module named 'lerobot'` / `'cv2'` / `'zmq'`**
+Run `./run.sh bash install_robot_deps.sh` once. Packages are saved to
+`~/.docker-packages` on the host and persist between container restarts.
 
 **`ModuleNotFoundError: No module named 'gr00t'`**
 `run.sh` adds `~/Isaac-GR00T` to `PYTHONPATH`. Verify that directory exists on the host.
 
+**`ModuleNotFoundError: No module named 'cupy'` when running the ZMQ server**
+You ran `python pipeline/imx274_zmq_server.py` directly on the host. It must run
+inside Docker where `cupy` and Holoscan are available:
+```bash
+./run.sh python pipeline/imx274_zmq_server.py --camera-mode 1 --headless
+```
+
 **ZMQ camera timeout / no frames received**
-Ensure `imx274_zmq_server.py` is running inside Docker before starting the recorder.
-Check that port 5556 is not blocked. Try `--zmq-host <jetson-ip>` if running the
-recorder on a different machine.
+Ensure `imx274_zmq_server.py` is running **inside Docker** before starting the
+recorder on the host. Check that port 5556 is not blocked. Try
+`--zmq-host <jetson-ip>` if running the recorder on a different machine.
+
+**`FileExistsError` when starting a new dataset**
+The dataset folder already exists (e.g. from a previous session or a `.gitkeep`
+placeholder). Either delete it to start fresh or pass `--resume`:
+```bash
+rm -rf datasets/control_blue_only
+# or
+python recording/imx274_lerobot_record.py ... --resume
+```
+
+**Both arms are stiff / locked during recording**
+This happened when both arms were set up identically in position-control mode with
+torque enabled. The leader arm must have torque **off** so you can move it freely.
+This is now handled automatically — the script sets the leader to compliant mode
+and the follower to torque-on mode before recording begins.
 
 **`Failed to initialize glfw` / X11 errors**
 Run `xhost +` on the host before launching the container.

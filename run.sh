@@ -42,7 +42,7 @@ docker run \
     -e NVIDIA_DRIVER_CAPABILITIES=graphics,video,compute,utility,display \
     -e NVIDIA_VISIBLE_DEVICES=all \
     -e DISPLAY="$DISPLAY" \
-    -e PYTHONPATH=/opt/nvidia/holoscan/python/lib:/home/latticeapp/Isaac-GR00T:${PYTHONPATH:-} \
+    -e PYTHONPATH=/opt/nvidia/holoscan/python/lib:/home/latticeapp/Isaac-GR00T:/home/latticeapp/.docker-packages:${PYTHONPATH:-} \
     -e enableRawReprocess=2 \
     "$IMAGE" \
     $CMD

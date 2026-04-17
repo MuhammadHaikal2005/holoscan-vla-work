@@ -126,8 +126,12 @@ DATASETS = {
 # Motor bus helpers (mirrors linux_imx274_player.py)
 # ---------------------------------------------------------------------------
 
-def _create_and_connect_bus(port, calibration_path, label="arm"):
-    """Create, configure and connect a FeetechMotorsBus for an SO-101 arm."""
+def _create_and_connect_bus(port, calibration_path, label="arm", is_leader=False):
+    """Create, configure and connect a FeetechMotorsBus for an SO-101 arm.
+
+    is_leader=True  → torque stays OFF after setup; the human moves it freely.
+    is_leader=False → torque is enabled after setup; the arm holds/follows positions.
+    """
     import json
 
     from lerobot.motors import Motor, MotorCalibration, MotorNormMode
@@ -161,13 +165,35 @@ def _create_and_connect_bus(port, calibration_path, label="arm"):
         bus.configure_motors()
         for motor in bus.motors:
             bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
-            bus.write("P_Coefficient", motor, 16)
-            bus.write("I_Coefficient", motor, 0)
-            bus.write("D_Coefficient", motor, 32)
+            if not is_leader:
+                # Follower: stiff position tracking
+                bus.write("P_Coefficient", motor, 16)
+                bus.write("I_Coefficient", motor, 0)
+                bus.write("D_Coefficient", motor, 32)
+            else:
+                # Leader: soft/backdriveable — low gains so it doesn't fight back
+                bus.write("P_Coefficient", motor, 8)
+                bus.write("I_Coefficient", motor, 0)
+                bus.write("D_Coefficient", motor, 0)
             if motor == "gripper":
                 bus.write("Max_Torque_Limit", motor, 500)
                 bus.write("Protection_Current", motor, 250)
                 bus.write("Overload_Torque", motor, 25)
+
+    if is_leader:
+        # Leader arm must stay compliant so the operator can move it freely.
+        # Torque stays off — we only ever READ positions from it.
+        for motor in bus.motors:
+            bus.write("Torque_Enable", motor, 0)
+        logging.info("%s: torque OFF (leader/compliant mode) on %s", label, port)
+    else:
+        # Follower: read current position first, set it as the goal, THEN
+        # enable torque so the arm doesn't jump when recording starts.
+        current = bus.sync_read("Present_Position")
+        bus.sync_write("Goal_Position", current)
+        for motor in bus.motors:
+            bus.write("Torque_Enable", motor, 1)
+        logging.info("%s: torque ON (follower mode) on %s", label, port)
 
     logging.info("%s: connected on %s", label, port)
     return bus
@@ -506,13 +532,56 @@ def main():
     leader_bus = None
     if args.leader_port:
         leader_cal = os.path.join(args.leader_calibration_dir, f"{args.leader_id}.json")
-        leader_bus = _create_and_connect_bus(args.leader_port, leader_cal, "leader")
+        leader_bus = _create_and_connect_bus(args.leader_port, leader_cal, "leader", is_leader=True)
 
     # ------------------------------------------------------------------ Dataset
     features = build_features(img_h, img_w)
-    root.mkdir(parents=True, exist_ok=True)
+
+    if not args.resume and root.exists():
+        import shutil
+        contents = list(root.iterdir())
+        is_placeholder = contents == [] or (len(contents) == 1 and contents[0].name == ".gitkeep")
+
+        if is_placeholder:
+            shutil.rmtree(root)
+        else:
+            # Dataset folder already has real data — ask the user what to do.
+            existing_episodes = 0
+            try:
+                existing_episodes = len(list((root / "episodes").glob("episode_*.parquet")))
+            except Exception:
+                pass
+
+            print()
+            print("─" * 68)
+            print(f"  ⚠  Dataset folder already exists: {root}")
+            if existing_episodes:
+                print(f"     Contains {existing_episodes} recorded episode(s).")
+            print("─" * 68)
+            print("  [d]  Delete it and start a fresh recording session")
+            print("  [r]  Resume — keep existing episodes and continue recording")
+            print("  [q]  Quit")
+            print()
+
+            while True:
+                choice = input("  Choice [d/r/q]: ").strip().lower()
+                if choice in ("d", "r", "q"):
+                    break
+                print("  Please type d, r, or q.")
+
+            print()
+            if choice == "q":
+                raise SystemExit(0)
+            elif choice == "d":
+                shutil.rmtree(root)
+                print(f"  Deleted {root}. Starting fresh.\n")
+            else:
+                args.resume = True
+                print("  Resuming existing dataset.\n")
 
     if args.resume:
+        # For resume, ensure the directory exists (LeRobotDataset needs it).
+        root.mkdir(parents=True, exist_ok=True)
         dataset = LeRobotDataset(
             repo_id,
             root=str(root),
