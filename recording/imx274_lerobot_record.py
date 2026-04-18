@@ -38,7 +38,13 @@ import os
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+# Suppress Qt "cannot find font directory" warnings that opencv-python emits
+# on systems where the conda Qt fonts are missing (harmless, display still works).
+os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts.warning=false")
 
 from lerobot.cameras.zmq import ZMQCamera, ZMQCameraConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -199,16 +205,271 @@ def _create_and_connect_bus(port, calibration_path, label="arm", is_leader=False
     return bus
 
 
-def _read_joint_positions(bus) -> np.ndarray:
+def _read_joint_positions(bus, retries: int = 3) -> np.ndarray:
     """Synchronously read all 6 joint positions; returns float32 array shape (6,)."""
-    pos = bus.sync_read("Present_Position")
-    return np.array([pos[j] for j in JOINT_NAMES], dtype=np.float32)
+    for attempt in range(retries):
+        try:
+            pos = bus.sync_read("Present_Position")
+            return np.array([pos[j] for j in JOINT_NAMES], dtype=np.float32)
+        except Exception as e:
+            if attempt < retries - 1:
+                logging.debug("Joint read attempt %d failed: %s — retrying", attempt + 1, e)
+                time.sleep(0.005)
+            else:
+                raise
 
 
 def _write_joint_positions(bus, positions: np.ndarray) -> None:
     """Synchronously write 6 joint goal positions from a float32 array shape (6,)."""
     goal = {j: float(positions[i]) for i, j in enumerate(JOINT_NAMES)}
     bus.sync_write("Goal_Position", goal)
+
+
+# ---------------------------------------------------------------------------
+# Live preview window
+# ---------------------------------------------------------------------------
+
+_PREVIEW_WIN  = "IMX274 Recording Preview"
+_DISPLAY_H    = 600     # height the preview window renders at — change this to taste
+_PANEL_W      = 300    # side panel width at display resolution
+_PANEL_BG     = (30,  30,  30)
+_CLR_WHITE    = (240, 240, 240)
+_CLR_DIM      = (130, 130, 130)
+_CLR_RED      = (220,  60,  60)   # RGB for Pillow
+_CLR_YELLOW   = (220, 200,  30)
+_CLR_DIVIDER  = (60,  60,  60)
+
+_help_visible = False   # toggled by pressing H in the preview window
+
+# ---------------------------------------------------------------------------
+# TrueType font loader (falls back to OpenCV if fonts not found)
+# ---------------------------------------------------------------------------
+_FONT_PATHS = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+]
+_FONT_BOLD_PATHS = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+]
+
+def _load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    paths = _FONT_BOLD_PATHS if bold else _FONT_PATHS
+    for p in paths:
+        if Path(p).exists():
+            return ImageFont.truetype(p, size)
+    return ImageFont.load_default()
+
+
+# Pre-load at a few sizes used by the panel
+_F_LABEL  = _load_font(11)          # section headers (DIM, all-caps)
+_F_VALUE  = _load_font(18, bold=True)   # big numbers / status
+_F_BODY   = _load_font(13)          # descriptions
+_F_BOLD   = _load_font(13, bold=True)   # key names
+_F_HINT   = _load_font(11)          # footer hint
+
+
+def _pil_panel(h: int) -> tuple[Image.Image, ImageDraw.ImageDraw]:
+    """Create a blank Pillow panel image and its draw context."""
+    img = Image.new("RGB", (_PANEL_W, h), _PANEL_BG)
+    return img, ImageDraw.Draw(img)
+
+
+def _draw_divider(draw: ImageDraw.ImageDraw, y: int):
+    draw.line([(12, y), (_PANEL_W - 12, y)], fill=_CLR_DIVIDER, width=1)
+
+
+def _build_panel(phase: str, episode: int, total: int,
+                 frame_count: int, task: str, cam_h: int) -> np.ndarray:
+    """Build the side info panel using Pillow TrueType fonts."""
+    img, draw = _pil_panel(cam_h)
+
+    phase_lower = phase.lower()
+    if "record" in phase_lower:
+        status, colour = "RECORDING", _CLR_RED
+    elif "reset" in phase_lower:
+        status, colour = "RESET",     _CLR_YELLOW
+    else:
+        status, colour = phase.upper(), _CLR_DIM
+
+    PAD = 16
+    y   = 20
+
+    # ── Status ───────────────────────────────────────────────────
+    draw.text((PAD, y), status, font=_F_VALUE, fill=colour);  y += 30
+    _draw_divider(draw, y);  y += 14
+
+    # ── Episode progress ─────────────────────────────────────────
+    draw.text((PAD, y), "EPISODE", font=_F_LABEL, fill=_CLR_DIM);  y += 16
+    draw.text((PAD, y), f"{episode}  /  {total}", font=_F_VALUE, fill=_CLR_WHITE);  y += 26
+    # Progress bar
+    bx, bw, bh = PAD, _PANEL_W - PAD * 2, 6
+    draw.rectangle([bx, y, bx + bw, y + bh], fill=(55, 55, 55))
+    filled = int(bw * episode / max(total, 1))
+    if filled > 0:
+        draw.rectangle([bx, y, bx + filled, y + bh], fill=colour)
+    y += bh + 14
+    _draw_divider(draw, y);  y += 14
+
+    # ── Frames captured ──────────────────────────────────────────
+    draw.text((PAD, y), "FRAMES CAPTURED", font=_F_LABEL, fill=_CLR_DIM);  y += 16
+    frame_str = str(frame_count) if "record" in phase_lower else "-"
+    draw.text((PAD, y), frame_str, font=_F_VALUE, fill=_CLR_WHITE);  y += 30
+    _draw_divider(draw, y);  y += 14
+
+    # ── Task ─────────────────────────────────────────────────────
+    draw.text((PAD, y), "TASK", font=_F_LABEL, fill=_CLR_DIM);  y += 16
+    words, line, lines = task.split(), "", []
+    for w in words:
+        test = (line + " " + w).strip()
+        if draw.textlength(test, font=_F_BODY) > _PANEL_W - PAD * 2:
+            lines.append(line.strip())
+            line = w
+        else:
+            line = test
+    if line.strip():
+        lines.append(line.strip())
+    for ln in lines:
+        draw.text((PAD, y), ln, font=_F_BODY, fill=_CLR_WHITE);  y += 18
+    y += 6
+    _draw_divider(draw, y);  y += 14
+
+    # ── Keyboard controls (summary) ──────────────────────────────
+    draw.text((PAD, y), "KEYBOARD CONTROLS", font=_F_LABEL, fill=_CLR_DIM);  y += 16
+    controls = [
+        ("Right arrow  ->", "Save & continue"),
+        ("Left arrow   <-", "Discard & re-record"),
+        ("Escape",          "Save & stop"),
+    ]
+    for key, desc in controls:
+        draw.text((PAD, y),      key,  font=_F_BOLD, fill=_CLR_WHITE);  y += 16
+        draw.text((PAD + 4, y),  desc, font=_F_BODY, fill=_CLR_DIM);   y += 18
+
+    # ── Help hint (bottom) ────────────────────────────────────────
+    draw.text((PAD, cam_h - 18), "Press H for help", font=_F_HINT, fill=_CLR_DIM)
+
+    # Convert PIL RGB → numpy BGR for cv2
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+
+def _build_help_overlay(canvas: np.ndarray) -> np.ndarray:
+    """Draw a full-canvas semi-transparent help overlay using Pillow text."""
+    h, w = canvas.shape[:2]
+
+    # Dark semi-transparent background
+    bg = np.full_like(canvas, (18, 18, 18))
+    overlay_np = cv2.addWeighted(bg, 0.88, canvas, 0.12, 0)
+
+    # Composite text via Pillow on top of the darkened numpy frame
+    pil_img = Image.fromarray(cv2.cvtColor(overlay_np, cv2.COLOR_BGR2RGB))
+    draw    = ImageDraw.Draw(pil_img)
+
+    _F_TITLE  = _load_font(22, bold=True)
+    _F_KEY    = _load_font(15, bold=True)
+    _F_DESC   = _load_font(13)
+
+    cx = w // 2
+    lx = cx - 380     # left edge of text block
+    y  = 50
+
+    def centre(text, font, colour):
+        nonlocal y
+        tw = draw.textlength(text, font=font)
+        draw.text((cx - tw // 2, y), text, font=font, fill=colour)
+
+    def hline():
+        nonlocal y
+        draw.line([(lx, y), (cx + 380, y)], fill=_CLR_DIVIDER, width=1)
+
+    # Title
+    centre("RECORDING CONTROLS  —  HELP", _F_TITLE, _CLR_WHITE);  y += 30
+    hline();  y += 22
+
+    sections = [
+        (
+            "Right arrow  ->    Save & continue",
+            [
+                "Ends the current recording phase early and saves the episode",
+                "immediately. Use this when the task is complete before the",
+                "timer runs out — no need to wait for the full duration.",
+            ],
+        ),
+        (
+            "Left arrow   <-    Discard & re-record",
+            [
+                "Throws away everything recorded in the current episode and",
+                "restarts it from scratch. Use this if something went wrong —",
+                "arm collision, object fell, or you want a cleaner demo.",
+            ],
+        ),
+        (
+            "Escape             Save & stop all recording",
+            [
+                "Saves the current episode, exits the recording loop, and",
+                "finalises the dataset. You can resume later with --resume.",
+            ],
+        ),
+        (
+            "H                  Toggle this help screen",
+            [
+                "Press H at any time to show or hide this overlay.",
+                "Recording continues in the background while help is shown.",
+            ],
+        ),
+    ]
+
+    for title, desc_lines in sections:
+        draw.text((lx, y), title, font=_F_KEY, fill=_CLR_WHITE);   y += 24
+        for line in desc_lines:
+            draw.text((lx + 8, y), line, font=_F_DESC, fill=_CLR_DIM);  y += 18
+        y += 10
+        hline();  y += 18
+
+    hint = "Press H to close"
+    hw = draw.textlength(hint, font=_F_DESC)
+    draw.text((cx - hw // 2, y + 6), hint, font=_F_DESC, fill=_CLR_DIM)
+
+    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+
+def draw_preview(frame_bgr: np.ndarray, phase: str, episode: int,
+                 total: int, frame_count: int, task: str) -> None:
+    """Composite the camera feed with the side panel and display it.
+
+    The camera frame is resized to _DISPLAY_H so that the composited canvas
+    is shown at its native pixel size — no window scaling, no blur.
+    Pressing H toggles the help overlay.
+    """
+    global _help_visible
+
+    # Resize camera frame to display height (keep aspect ratio)
+    h, w = frame_bgr.shape[:2]
+    display_w = int(w * _DISPLAY_H / h)
+    cam_display = cv2.resize(frame_bgr, (display_w, _DISPLAY_H), interpolation=cv2.INTER_AREA)
+
+    # Build panel at the same height
+    panel  = _build_panel(phase, episode, total, frame_count, task, _DISPLAY_H)
+    canvas = np.concatenate([cam_display, panel], axis=1)
+
+    if _help_visible:
+        canvas = _build_help_overlay(canvas)
+
+    cv2.imshow(_PREVIEW_WIN, canvas)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('h') or key == ord('H'):
+        _help_visible = not _help_visible
+
+
+def close_preview() -> None:
+    """Destroy the preview window if it exists."""
+    try:
+        cv2.destroyWindow(_PREVIEW_WIN)
+        cv2.waitKey(1)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +546,9 @@ def record_episode(
     fps: int,
     episode_time_s: float,
     events: dict,
+    episode_idx: int = 0,
+    total_episodes: int = 0,
+    show_preview: bool = False,
 ) -> int:
     """Record a single episode into *dataset* and return the frame count.
 
@@ -338,6 +602,11 @@ def record_episode(
 
         frame_count += 1
 
+        # --- Preview window ---
+        if show_preview:
+            draw_preview(frame_bgr, "Recording", episode_idx, total_episodes,
+                         frame_count, task)
+
         elapsed = time.perf_counter() - t0
         precise_sleep(max(dt - elapsed, 0.0))
 
@@ -351,6 +620,10 @@ def reset_phase(
     fps: int,
     reset_time_s: float,
     events: dict,
+    episode_idx: int = 0,
+    total_episodes: int = 0,
+    task: str = "",
+    show_preview: bool = False,
 ) -> None:
     """Wait during environment reset — optionally mirrors leader arm."""
     dt = 1.0 / fps
@@ -364,7 +637,11 @@ def reset_phase(
             action = _read_joint_positions(leader_bus)
             _write_joint_positions(follower_bus, action)
 
-        precise_sleep(dt)
+        if show_preview:
+            frame_bgr = camera.async_read(timeout_ms=500)
+            draw_preview(frame_bgr, "Reset", episode_idx, total_episodes, 0, task)
+        else:
+            precise_sleep(dt)
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +766,8 @@ def main():
     parser.add_argument("--log-level", type=int, default=20)
     parser.add_argument("--resume", action="store_true",
                         help="Resume recording on an existing dataset")
+    parser.add_argument("--no-preview", action="store_true",
+                        help="Disable the live camera preview window")
 
     args = parser.parse_args()
 
@@ -498,10 +777,26 @@ def main():
     # ------------------------------------------------------------------ Dataset selection
     ds_config = select_dataset(args.dataset)
 
-    repo_id     = args.repo_id     or ds_config["repo_id"]
-    num_episodes = args.num_episodes or ds_config["num_episodes"]
-    root        = Path(args.root)  if args.root else DATASETS_ROOT / ds_config["folder"]
-    task        = TASK_PROMPT
+    repo_id = args.repo_id or ds_config["repo_id"]
+    root    = Path(args.root) if args.root else DATASETS_ROOT / ds_config["folder"]
+    task    = TASK_PROMPT
+
+    # Ask how many episodes to record (skip prompt if passed via --num-episodes)
+    if args.num_episodes:
+        num_episodes = args.num_episodes
+    else:
+        default_eps = ds_config["num_episodes"]
+        print()
+        while True:
+            raw = input(f"  How many episodes do you want to record? [default: {default_eps}]: ").strip()
+            if raw == "":
+                num_episodes = default_eps
+                break
+            if raw.isdigit() and int(raw) > 0:
+                num_episodes = int(raw)
+                break
+            print("  Please enter a positive whole number.")
+        print()
 
     logging.info("Dataset : %s", ds_config["label"])
     logging.info("Repo ID : %s", repo_id)
@@ -524,6 +819,39 @@ def main():
     img_h = camera.height
     img_w = camera.width
     logging.info("Camera resolution detected: %dx%d", img_w, img_h)
+
+    # ------------------------------------------------------------------ Preview check
+    show_preview = not args.no_preview
+    if show_preview:
+        try:
+            # Open the window now at full size so it's ready before recording starts.
+            # Use WINDOW_NORMAL so the user can resize it freely.
+            # WINDOW_GUI_NORMAL removes the Qt toolbar icons.
+            # WINDOW_AUTOSIZE prevents cv2 from rescaling the canvas —
+            # we manage the display size ourselves via _DISPLAY_H.
+            cv2.namedWindow(_PREVIEW_WIN, cv2.WINDOW_GUI_NORMAL | cv2.WINDOW_AUTOSIZE)
+            cam_w = int(16 / 9 * _DISPLAY_H)   # 16:9 placeholder
+            cam_area = np.zeros((_DISPLAY_H, cam_w, 3), dtype=np.uint8)
+            # Placeholder text via Pillow so it's sharp too
+            pil_tmp = Image.fromarray(cam_area)
+            _f = _load_font(18)
+            _d = ImageDraw.Draw(pil_tmp)
+            msg = "Waiting for first frame..."
+            tw = _d.textlength(msg, font=_f)
+            _d.text((cam_w // 2 - tw // 2, _DISPLAY_H // 2 - 10),
+                    msg, font=_f, fill=(140, 140, 140))
+            cam_area = cv2.cvtColor(np.array(pil_tmp), cv2.COLOR_RGB2BGR)
+            panel = _build_panel("Idle", 0, 0, 0, "...", _DISPLAY_H)
+            canvas = np.concatenate([cam_area, panel], axis=1)
+            cv2.imshow(_PREVIEW_WIN, canvas)
+            cv2.waitKey(1)
+        except cv2.error as e:
+            logging.warning(
+                "Preview window unavailable (%s). "
+                "Install 'opencv-python' (not headless) or run with --no-preview. "
+                "Continuing without preview.", e
+            )
+            show_preview = False
 
     # ------------------------------------------------------------------ Arms
     follower_cal = os.path.join(args.calibration_dir, f"{args.follower_id}.json")
@@ -639,6 +967,9 @@ def main():
                     fps=args.fps,
                     episode_time_s=args.episode_time_s,
                     events=events,
+                    episode_idx=recorded + 1,
+                    total_episodes=num_episodes,
+                    show_preview=show_preview,
                 )
                 logging.info("Episode ended: %d frames captured.", n_frames)
 
@@ -668,20 +999,33 @@ def main():
                         fps=args.fps,
                         reset_time_s=args.reset_time_s,
                         events=events,
+                        episode_idx=recorded,
+                        total_episodes=num_episodes,
+                        task=task,
+                        show_preview=show_preview,
                     )
 
     finally:
         log_say("Stopping recording", play_sounds=False)
 
+        if show_preview:
+            close_preview()
+
         camera.disconnect()
 
-        if follower_bus.is_connected:
-            follower_bus.disconnect(disable_torque=True)
-            logging.info("Follower arm disconnected.")
+        try:
+            if follower_bus.is_connected:
+                follower_bus.disconnect(disable_torque=True)
+                logging.info("Follower arm disconnected.")
+        except Exception as e:
+            logging.warning("Could not cleanly disconnect follower arm: %s", e)
 
-        if leader_bus is not None and leader_bus.is_connected:
-            leader_bus.disconnect(disable_torque=False)
-            logging.info("Leader arm disconnected.")
+        try:
+            if leader_bus is not None and leader_bus.is_connected:
+                leader_bus.disconnect(disable_torque=False)
+                logging.info("Leader arm disconnected.")
+        except Exception as e:
+            logging.warning("Could not cleanly disconnect leader arm: %s", e)
 
         if listener:
             listener.stop()
