@@ -427,6 +427,17 @@ torque enabled. The leader arm must have torque **off** so you can move it freel
 This is now handled automatically — the script sets the leader to compliant mode
 and the follower to torque-on mode before recording begins.
 
+**Arm stuck with torque on after a crash**
+If the recording script crashes mid-startup (e.g. `ConnectionError: Incorrect status packet`
+on the leader arm), the follower may be left locked rigid. Run the rescue script to
+release all motors on both arms without needing the lerobot environment:
+```bash
+python recording/torque_off.py
+```
+It sends raw Feetech torque-off packets to IDs 1–6 on `/dev/ttyACM0` and `/dev/ttyACM1`.
+If a port is not connected it is skipped safely. The most common cause of the crash is
+a loose USB cable on the leader arm — reseat it before retrying.
+
 **`Failed to initialize glfw` / X11 errors**
 Run `xhost +` on the host before launching the container.
 
