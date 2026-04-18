@@ -39,13 +39,14 @@ hsb-groot-robot/
 │
 ├── notes/                     Session notes, organised by date
 │   ├── assets/
-│   │   └── 2026-04-16/        Screenshots and images from that session
+│   │   └── 2026-04-18/        Screenshots and images from that session
 │   ├── 2026-04-16/
 │   │   ├── hsb-udp-payload-sender-debugging.md
-│   │   ├── zmq-recording-pipeline-and-dataset-setup.md
-│   │   └── reset-phase-and-gui-panel-improvements.md
+│   │   └── zmq-recording-pipeline-and-dataset-setup.md
 │   └── 2026-04-18/
-│       └── recording-preview-window-and-ux-improvements.md
+│       ├── recording-preview-window-and-ux-improvements.md
+│       ├── reset-phase-and-gui-panel-improvements.md
+│       └── arm-rescue-torque-off-script.md
 │
 └── logs/                      Runtime log output (gitignored)
 ```
@@ -281,7 +282,7 @@ side panel with real-time recording status. Pass `--no-preview` to disable it.
 
 | Recording state | Reset state |
 |---|---|
-| ![Recording state](notes/assets/2026-04-16/preview-recording-state.png) | ![Reset state](notes/assets/2026-04-16/preview-reset-state.png) |
+| ![Recording state](notes/assets/2026-04-18/preview-recording-state.png) | ![Reset state](notes/assets/2026-04-18/preview-reset-state.png) |
 
 The side panel shows the current phase (RECORDING / RESET), episode progress,
 frame count, task description, and keyboard shortcuts. During reset the panel

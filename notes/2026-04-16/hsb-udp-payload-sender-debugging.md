@@ -1,4 +1,5 @@
 # Debugging `thor_send_payload.py` — Full Journey
+**Date:** 2026-04-16
 
 This document chronicles every problem, root cause, and fix applied while getting
 `thor_send_payload.py` to successfully send a 32-bit payload to the HSB (Holoscan

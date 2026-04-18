@@ -1,5 +1,5 @@
 # Reset Phase and GUI Panel Improvements
-**Date:** 2026-04-16  
+**Date:** 2026-04-18  
 **Session goal:** Fix the reset phase to wait indefinitely for user input, surface the instructions inside the live preview GUI panel, and fix two separate box-sizing bugs.
 
 ---
@@ -8,7 +8,7 @@
 
 | Recording | Reset (waiting for → key) |
 |---|---|
-| ![Recording state](../assets/2026-04-16/preview-recording-state.png) | ![Reset state](../assets/2026-04-16/preview-reset-state.png) |
+| ![Recording state](../assets/2026-04-18/preview-recording-state.png) | ![Reset state](../assets/2026-04-18/preview-reset-state.png) |
 
 ---
 

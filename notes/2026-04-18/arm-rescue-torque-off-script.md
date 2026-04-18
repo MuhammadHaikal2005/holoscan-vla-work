@@ -1,5 +1,5 @@
 # Arm Rescue — torque_off.py
-**Date:** 2026-04-16  
+**Date:** 2026-04-18  
 **Session goal:** Handle the situation where the recording script crashes mid-startup, leaving one or both arms locked with torque enabled and no way to move them.
 
 ---
