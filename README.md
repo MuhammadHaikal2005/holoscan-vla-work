@@ -37,8 +37,15 @@ hsb-groot-robot/
 ├── references/                Upstream reference scripts
 │   └── lerobot_record.py
 │
-├── notes/                     Debugging documentation
-│   └── thor_send_payload_debugging.md
+├── notes/                     Session notes, organised by date
+│   ├── assets/
+│   │   └── 2026-04-16/        Screenshots and images from that session
+│   ├── 2026-04-16/
+│   │   ├── hsb-udp-payload-sender-debugging.md
+│   │   ├── zmq-recording-pipeline-and-dataset-setup.md
+│   │   └── reset-phase-and-gui-panel-improvements.md
+│   └── 2026-04-18/
+│       └── recording-preview-window-and-ux-improvements.md
 │
 └── logs/                      Runtime log output (gitignored)
 ```
@@ -257,12 +264,28 @@ python recording/imx274_lerobot_record.py \
     --no-push
 ```
 
-The script opens an **interactive menu** to select which experiment dataset
-to record into. Dataset names, repo IDs, scene setup instructions, and
-episode targets are all pre-configured in the script.
+The script opens an **interactive menu** to choose which experiment dataset to
+record into (control blue-only or mixed 80/20). Dataset names, repo IDs, scene
+setup instructions, and episode targets are all pre-configured in the script.
+It then asks how many episodes to record in this session.
+
+Pass `--dataset 1` or `--dataset 2` to skip the menu entirely.
 
 Omit `--leader-port` to record without teleoperation (follower holds its
 position, action = state).
+
+#### Live preview window
+
+A preview window opens automatically showing the live camera feed alongside a
+side panel with real-time recording status. Pass `--no-preview` to disable it.
+
+| Recording state | Reset state |
+|---|---|
+| ![Recording state](notes/assets/2026-04-16/preview-recording-state.png) | ![Reset state](notes/assets/2026-04-16/preview-reset-state.png) |
+
+The side panel shows the current phase (RECORDING / RESET), episode progress,
+frame count, task description, and keyboard shortcuts. During reset the panel
+shows a highlighted prompt reminding you to press `→` when ready.
 
 #### Arm torque modes
 
@@ -276,35 +299,43 @@ jump when recording starts.
 
 #### Starting fresh vs. resuming
 
-Delete the dataset folder to start a completely new recording session:
+When the recorder starts, if the target dataset folder already exists and
+`--resume` was not passed, the script prompts interactively:
 
-```bash
-rm -rf datasets/control_blue_only   # or experiment_mixed_8020
+```
+  ⚠  Dataset folder already exists: datasets/control_blue_only
+     Contains 9 recorded episode(s).
+  [d]  Delete it and start a fresh recording session
+  [r]  Resume — keep existing episodes and continue recording
+  [q]  Quit
 ```
 
-To continue adding episodes to an existing dataset (e.g. after stopping
-mid-way through 100 episodes):
+To skip the prompt you can either pass `--resume` directly or delete the folder
+beforehand:
 
 ```bash
-python recording/imx274_lerobot_record.py \
-    --follower-port /dev/ttyACM0 \
-    --follower-id my_awesome_follower_arm \
-    --leader-port /dev/ttyACM1 \
-    --leader-id my_leader \
-    --no-push \
-    --resume
+rm -rf datasets/control_blue_only   # start completely fresh
+# or
+python recording/imx274_lerobot_record.py ... --resume
 ```
 
-If the dataset folder already contains data and `--resume` is not passed,
-the script will print an error and exit rather than overwriting.
+When resuming, the episode counter starts from the number of already-saved
+episodes and the script asks how many total episodes you want, defaulting to
+the previous session's target.
 
 ### Keyboard controls during recording
 
-| Key | Action |
-|---|---|
-| Right arrow `→` | End current phase early and move on |
-| Left arrow `←` | Discard current episode and re-record it |
-| Escape | Save current episode and stop recording |
+| Key | Recording phase | Reset phase |
+|---|---|---|
+| Right arrow `→` | Save episode early and continue | Start the next episode |
+| Left arrow `←` | Discard episode and re-record | — |
+| Escape | Save episode and stop all recording | Stop all recording |
+| H | Toggle full-screen help overlay | Toggle full-screen help overlay |
+
+**The reset phase waits indefinitely.** After an episode finishes the script
+pauses in RESET state until you explicitly press `→`. Use this time to
+reposition the object and the robot arm. The preview panel displays a
+highlighted `PRESS → TO CONTINUE` prompt as a reminder.
 
 ### Arguments — imx274_zmq_server.py
 
@@ -325,25 +356,25 @@ the script will print an error and exit rather than overwriting.
 
 | Argument | Default | Description |
 |---|---|---|
-| `--repo-id` | required | Dataset repo ID, e.g. `my_user/my_dataset`. |
-| `--task` | required | Single-sentence task description. |
-| `--root` | HF_LEROBOT_HOME | Local directory to write the dataset. |
-| `--num-episodes` | `10` | Total episodes to record. |
+| `--dataset` | interactive | Skip the interactive menu and go straight to dataset `1` or `2`. |
+| `--repo-id` | from config | Override the repo ID from the selected dataset config. |
+| `--root` | from config | Override the local root directory for the dataset. |
+| `--num-episodes` | interactive | Override the episode count (otherwise prompted interactively). |
 | `--fps` | `30` | Target recording frame rate. |
 | `--episode-time` | `30` | Seconds of data per episode. |
-| `--reset-time` | `10` | Seconds to reset the scene between episodes. |
 | `--vcodec` | `h264_nvenc` | Video codec. `h264_nvenc` uses Jetson hardware encoder. |
 | `--zmq-host` | `localhost` | Host running `imx274_zmq_server.py`. |
 | `--zmq-port` | `5556` | ZMQ port (must match server). |
 | `--camera-name` | `front` | Camera name in the ZMQ stream. |
 | `--follower-port` | `/dev/ttyACM0` | Serial port for SO-101 follower arm. |
 | `--follower-id` | `my_follower` | Follower calibration ID. |
-| `--calibration-dir` | `~/.cache/huggingface/lerobot/calibration/robots/so_follower` | Directory with `<id>.json` calibration files. |
+| `--calibration-dir` | `~/.cache/.../so_follower` | Directory with follower `<id>.json` calibration files. |
 | `--leader-port` | off | Serial port for SO-101 leader arm (teleop). Omit to disable. |
-| `--leader-id` | `my_leader` | Leader calibration ID. |
+| `--leader-id` | `my_leader` | Leader arm calibration ID. |
 | `--no-push` | off | Skip pushing the finished dataset to Hugging Face Hub. |
 | `--private` | off | Make the Hub repository private. |
-| `--resume` | off | Resume recording into an existing dataset. |
+| `--resume` | off | Resume recording into an existing dataset (skip the d/r/q prompt). |
+| `--no-preview` | off | Disable the live camera preview window. |
 
 ---
 

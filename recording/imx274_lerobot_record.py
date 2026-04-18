@@ -30,7 +30,7 @@
 #   Escape       → save current episode and stop recording entirely
 #
 # Each episode records for --episode-time seconds, then automatically saves.
-# After each episode there is a --reset-time second window to reset the scene.
+# After each episode the script waits in RESET state until → is pressed.
 
 import argparse
 import logging
@@ -205,6 +205,25 @@ def _create_and_connect_bus(port, calibration_path, label="arm", is_leader=False
     return bus
 
 
+def _count_existing_episodes(root: Path) -> int:
+    """Return the number of episodes already saved in a LeRobotDataset folder."""
+    import json
+    # Prefer the authoritative meta/info.json written by LeRobot
+    info_path = root / "meta" / "info.json"
+    if info_path.exists():
+        try:
+            with open(info_path) as f:
+                return int(json.load(f).get("total_episodes", 0))
+        except Exception:
+            pass
+    # Fallback: count episode chunk files
+    for pattern in ("data/chunk-*/episode_*.parquet", "episodes/episode_*.parquet"):
+        files = list(root.glob(pattern))
+        if files:
+            return len(set(p.stem.split("_")[1] for p in files if "_" in p.stem))
+    return 0
+
+
 def _read_joint_positions(bus, retries: int = 3) -> np.ndarray:
     """Synchronously read all 6 joint positions; returns float32 array shape (6,)."""
     for attempt in range(retries):
@@ -336,13 +355,38 @@ def _build_panel(phase: str, episode: int, total: int,
     y += 6
     _draw_divider(draw, y);  y += 14
 
+    # ── Reset call-to-action (only during reset phase) ───────────
+    if "reset" in phase_lower:
+        LINE1_H = 16   # bold text height
+        LINE2_H = 14   # body text height
+        V_PAD   = 10   # top/bottom inner padding
+        LINE_GAP = 4   # gap between the two lines
+        box_h = V_PAD + LINE1_H + LINE_GAP + LINE2_H + V_PAD
+        box_x1, box_x2 = PAD, _PANEL_W - PAD
+        draw.rectangle([box_x1, y, box_x2, y + box_h],
+                       fill=(60, 50, 10), outline=_CLR_YELLOW, width=1)
+        draw.text((PAD + 8, y + V_PAD),
+                  "PRESS  \u2192  TO CONTINUE",
+                  font=_F_BOLD, fill=_CLR_YELLOW)
+        draw.text((PAD + 8, y + V_PAD + LINE1_H + LINE_GAP),
+                  "Reposition object & arm first",
+                  font=_F_BODY, fill=_CLR_DIM)
+        y += box_h + 12
+        _draw_divider(draw, y);  y += 14
+
     # ── Keyboard controls (summary) ──────────────────────────────
     draw.text((PAD, y), "KEYBOARD CONTROLS", font=_F_LABEL, fill=_CLR_DIM);  y += 16
-    controls = [
-        ("Right arrow  ->", "Save & continue"),
-        ("Left arrow   <-", "Discard & re-record"),
-        ("Escape",          "Save & stop"),
-    ]
+    if "reset" in phase_lower:
+        controls = [
+            ("Right arrow  ->", "Start next episode"),
+            ("Escape",          "Save & stop"),
+        ]
+    else:
+        controls = [
+            ("Right arrow  ->", "Save & continue"),
+            ("Left arrow   <-", "Discard & re-record"),
+            ("Escape",          "Save & stop"),
+        ]
     for key, desc in controls:
         draw.text((PAD, y),      key,  font=_F_BOLD, fill=_CLR_WHITE);  y += 16
         draw.text((PAD + 4, y),  desc, font=_F_BODY, fill=_CLR_DIM);   y += 18
@@ -618,28 +662,40 @@ def reset_phase(
     follower_bus,
     leader_bus,
     fps: int,
-    reset_time_s: float,
     events: dict,
     episode_idx: int = 0,
     total_episodes: int = 0,
     task: str = "",
     show_preview: bool = False,
 ) -> None:
-    """Wait during environment reset — optionally mirrors leader arm."""
+    """Wait during environment reset — holds indefinitely until → is pressed.
+
+    The operator uses this time to reposition the object and move the robot
+    arm back to its starting pose. Nothing is recorded. The follower arm
+    continues to mirror the leader arm (if connected) so the operator can
+    guide it back by hand.
+
+    Press → to start the next episode.
+    Press ESC to save the current state and stop recording entirely.
+    """
     dt = 1.0 / fps
-    start_t = time.perf_counter()
 
-    while (time.perf_counter() - start_t) < reset_time_s:
-        if events["exit_early"] or events["stop_recording"]:
-            break
+    print()
+    print("  ┌─────────────────────────────────────────────────────┐")
+    print("  │  RESET — reposition the object and the robot arm.   │")
+    print("  │  Press  →  when ready to record the next episode.   │")
+    print("  │  Press ESC to stop recording.                       │")
+    print("  └─────────────────────────────────────────────────────┘")
 
+    while not events["exit_early"] and not events["stop_recording"]:
         if leader_bus is not None:
             action = _read_joint_positions(leader_bus)
             _write_joint_positions(follower_bus, action)
 
         if show_preview:
             frame_bgr = camera.async_read(timeout_ms=500)
-            draw_preview(frame_bgr, "Reset", episode_idx, total_episodes, 0, task)
+            draw_preview(frame_bgr, "Reset — Press -> to continue",
+                         episode_idx, total_episodes, 0, task)
         else:
             precise_sleep(dt)
 
@@ -650,13 +706,13 @@ def reset_phase(
 
 def select_dataset(preselect: str | None) -> dict:
     """Print the experiment menu and return the chosen dataset config dict."""
-    W = 66
+    W = 76
 
     def rule():  return "╠" + "═" * W + "╣"
     def top():   return "╔" + "═" * W + "╗"
     def bot():   return "╚" + "═" * W + "╝"
     def row(s=""):
-        padding = W - len(s)
+        padding = max(0, W - len(s))
         return "║" + s + " " * padding + "║"
 
     print()
@@ -728,8 +784,7 @@ def main():
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--episode-time", type=float, default=30.0, dest="episode_time_s",
                         help="Seconds of data per episode (default: 30)")
-    parser.add_argument("--reset-time", type=float, default=10.0, dest="reset_time_s",
-                        help="Seconds to reset the environment between episodes (default: 10)")
+    # --reset-time removed: reset phase now waits indefinitely for → key press.
     parser.add_argument("--vcodec", default="h264_nvenc",
                         help="Video codec for encoding (default: h264_nvenc for Jetson). "
                              "Falls back to h264 automatically if nvenc is unavailable.")
@@ -781,9 +836,71 @@ def main():
     root    = Path(args.root) if args.root else DATASETS_ROOT / ds_config["folder"]
     task    = TASK_PROMPT
 
-    # Ask how many episodes to record (skip prompt if passed via --num-episodes)
+    # ------------------------------------------------------------------ Folder check
+    # Must run BEFORE the episode count prompt so that on resume we know how
+    # many episodes already exist and can ask a meaningful question.
+    if not args.resume and root.exists():
+        import shutil
+        contents = list(root.iterdir())
+        is_placeholder = contents == [] or (len(contents) == 1 and contents[0].name == ".gitkeep")
+
+        if is_placeholder:
+            shutil.rmtree(root)
+        else:
+            existing_episodes = _count_existing_episodes(root)
+
+            print()
+            print("─" * 68)
+            print(f"  ⚠  Dataset folder already exists: {root}")
+            if existing_episodes:
+                print(f"     Contains {existing_episodes} recorded episode(s).")
+            print("─" * 68)
+            print("  [d]  Delete it and start a fresh recording session")
+            print("  [r]  Resume — keep existing episodes and continue recording")
+            print("  [q]  Quit")
+            print()
+
+            while True:
+                choice = input("  Choice [d/r/q]: ").strip().lower()
+                if choice in ("d", "r", "q"):
+                    break
+                print("  Please type d, r, or q.")
+
+            print()
+            if choice == "q":
+                raise SystemExit(0)
+            elif choice == "d":
+                shutil.rmtree(root)
+                print(f"  Deleted {root}. Starting fresh.\n")
+            else:
+                args.resume = True
+                print("  Resuming existing dataset.\n")
+
+    # ------------------------------------------------------------------ Episode count
     if args.num_episodes:
         num_episodes = args.num_episodes
+    elif args.resume:
+        # On resume: show how many already exist and ask for the TOTAL target.
+        existing_episodes = _count_existing_episodes(root)
+        default_total = max(ds_config["num_episodes"], existing_episodes + 1)
+        print()
+        print(f"  {existing_episodes} episode(s) already recorded.")
+        while True:
+            raw = input(
+                f"  Record up to how many episodes in total? [default: {default_total}]: "
+            ).strip()
+            if raw == "":
+                num_episodes = default_total
+                break
+            if raw.isdigit() and int(raw) > existing_episodes:
+                num_episodes = int(raw)
+                break
+            if raw.isdigit() and int(raw) <= existing_episodes:
+                print(f"  Must be greater than the {existing_episodes} already recorded.")
+            else:
+                print("  Please enter a positive whole number.")
+        remaining = num_episodes - existing_episodes
+        print(f"  Will record {remaining} more episode(s) to reach {num_episodes} total.\n")
     else:
         default_eps = ds_config["num_episodes"]
         print()
@@ -865,48 +982,6 @@ def main():
     # ------------------------------------------------------------------ Dataset
     features = build_features(img_h, img_w)
 
-    if not args.resume and root.exists():
-        import shutil
-        contents = list(root.iterdir())
-        is_placeholder = contents == [] or (len(contents) == 1 and contents[0].name == ".gitkeep")
-
-        if is_placeholder:
-            shutil.rmtree(root)
-        else:
-            # Dataset folder already has real data — ask the user what to do.
-            existing_episodes = 0
-            try:
-                existing_episodes = len(list((root / "episodes").glob("episode_*.parquet")))
-            except Exception:
-                pass
-
-            print()
-            print("─" * 68)
-            print(f"  ⚠  Dataset folder already exists: {root}")
-            if existing_episodes:
-                print(f"     Contains {existing_episodes} recorded episode(s).")
-            print("─" * 68)
-            print("  [d]  Delete it and start a fresh recording session")
-            print("  [r]  Resume — keep existing episodes and continue recording")
-            print("  [q]  Quit")
-            print()
-
-            while True:
-                choice = input("  Choice [d/r/q]: ").strip().lower()
-                if choice in ("d", "r", "q"):
-                    break
-                print("  Please type d, r, or q.")
-
-            print()
-            if choice == "q":
-                raise SystemExit(0)
-            elif choice == "d":
-                shutil.rmtree(root)
-                print(f"  Deleted {root}. Starting fresh.\n")
-            else:
-                args.resume = True
-                print("  Resuming existing dataset.\n")
-
     if args.resume:
         # For resume, ensure the directory exists (LeRobotDataset needs it).
         root.mkdir(parents=True, exist_ok=True)
@@ -947,10 +1022,12 @@ def main():
     # ------------------------------------------------------------------ Episode loop
     try:
         with VideoEncodingManager(dataset):
-            recorded = 0
+            # On resume, start the counter at however many episodes are already
+            # saved so numbering and the loop condition are both correct.
+            recorded = dataset.num_episodes
 
             while recorded < num_episodes and not events["stop_recording"]:
-                log_say(f"Recording episode {dataset.num_episodes + 1} of {num_episodes}", play_sounds=False)
+                log_say(f"Recording episode {recorded + 1} of {num_episodes}", play_sounds=False)
                 print(f"\n  Episode {recorded + 1} / {num_episodes}  |  task: \"{task}\"")
                 logging.info("Recording for %.0fs …", args.episode_time_s)
 
@@ -990,14 +1067,13 @@ def main():
                 # Reset phase (skip after last episode)
                 if not events["stop_recording"] and recorded < num_episodes:
                     log_say("Reset the environment", play_sounds=False)
-                    logging.info("Reset phase: %.0fs …", args.reset_time_s)
+                    logging.info("Reset phase: waiting for -> key …")
                     events["exit_early"] = False
                     reset_phase(
                         camera=camera,
                         follower_bus=follower_bus,
                         leader_bus=leader_bus,
                         fps=args.fps,
-                        reset_time_s=args.reset_time_s,
                         events=events,
                         episode_idx=recorded,
                         total_episodes=num_episodes,
