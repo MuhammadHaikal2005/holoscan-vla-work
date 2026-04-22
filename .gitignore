@@ -7,6 +7,10 @@ build/
 *.csv
 *.log
 logs/
+# Model weights and checkpoints (large binary — store separately)
+models/
+checkpoints/
+
 # Dataset files (large binary data — store separately or on HF Hub)
 datasets/**/*.parquet
 datasets/**/*.mp4
