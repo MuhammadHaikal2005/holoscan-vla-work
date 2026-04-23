@@ -67,16 +67,14 @@ source scripts/activate_thor.sh 2>/dev/null || true
 
 VENV_CUDA_LIBS="$GROOT_DIR/.venv/lib/python3.12/site-packages/nvidia/cu13/lib"
 export LD_LIBRARY_PATH="$VENV_CUDA_LIBS:${LD_LIBRARY_PATH:-}"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 VENV_PYTHON="$GROOT_DIR/.venv/bin/python3"
 
-# ── torchcodec: ensure the FFmpeg-6 build is installed ─────────────────────────
-TC_WHEEL="$GROOT_DIR/wheels/torchcodec-0.10.0a0-cp312-cp312-linux_aarch64.whl"
-TC_CORE6="$GROOT_DIR/.venv/lib/python3.12/site-packages/torchcodec/libtorchcodec_core6.so"
-if [[ ! -f "$TC_CORE6" ]]; then
-    echo "torchcodec: FFmpeg-6 build missing — reinstalling from cached wheel..."
-    uv pip install --python "$VENV_PYTHON" --no-deps "$TC_WHEEL"
-    echo "torchcodec: reinstalled OK"
+# ── torchcodec: verify the x86_64 wheel loaded correctly ──────────────────────
+if ! "$VENV_PYTHON" -c "import torchcodec" 2>/dev/null; then
+    echo "ERROR: torchcodec failed to load. Try: sudo apt install ffmpeg"
+    exit 1
 fi
 
 # ── Launch ─────────────────────────────────────────────────────────────────────
@@ -89,6 +87,6 @@ CUDA_VISIBLE_DEVICES=0 "$VENV_PYTHON" gr00t/experiment/launch_finetune.py \
     --output-dir      "$OUTPUT" \
     --max-steps       2000 \
     --save-steps      500 \
-    --global-batch-size 16 \
-    --dataloader-num-workers 4 \
+    --global-batch-size 8 \
+    --dataloader-num-workers 2 \
     "$@"
