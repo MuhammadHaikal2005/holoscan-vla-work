@@ -109,6 +109,23 @@ DATASETS = {
         ],
         "num_episodes": 100,
     },
+    "3": {
+        "label":       "FIXED CUBE — controlled position v1",
+        "folder":      "fixed_cube_v1",
+        "repo_id":     "latticeapp/fixed-cube-v1",
+        "description": (
+            "Fixed-position cube dataset. Cameras and arm base are locked down.\n"
+            "Cube placed on a taped marker every episode — no variation in position.\n"
+            "Hypothesis: removing position variance lets the model learn one clean trajectory."
+        ),
+        "scene_setup": [
+            "  • Place the CUBE on the taped marker on the table.",
+            "  • Do NOT move the cameras or arm base between episodes.",
+            "  • Return the arm to the same home pose before each episode.",
+            "  • No other objects should be visible in the scene.",
+        ],
+        "num_episodes": 100,
+    },
 }
 
 
@@ -847,6 +864,24 @@ def main():
                     log_say("Discarding episode — re-recording", play_sounds=False)
                     dataset.clear_episode_buffer()
                     events["rerecord_episode"] = False
+                    events["exit_early"] = False
+                    # Give the user a reset phase to reposition before the
+                    # next recording starts — without this, repositioning frames
+                    # would be captured into the new episode buffer.
+                    print()
+                    print("  Episode discarded. Reposition the robot and object,")
+                    print("  then press  →  when ready to re-record.")
+                    reset_phase(
+                        cam0=cam0, cam1=cam1,
+                        follower_bus=follower_bus,
+                        leader_bus=leader_bus,
+                        fps=args.fps,
+                        events=events,
+                        episode_idx=recorded + 1,
+                        total_episodes=num_episodes,
+                        task=task,
+                        show_preview=show_preview,
+                    )
                     events["exit_early"] = False
                     continue
 
